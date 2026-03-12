@@ -157,9 +157,9 @@ Key parameters (all adjustable in the GUI Settings tab):
 ## Acknowledgements
 
 - **[OscGoesBrrr](https://github.com/OscToys/OscGoesBrrr)** by [Senky Dragon](https://github.com/OscToys) — VRChat avatar OSC contact system that feeds proximity data into this bridge. Licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
-- **[ReStim](https://github.com/diglet48/restim)** by [diglet48](https://github.com/diglet48) — e-stim control software that receives T-Code commands from this bridge.
+- **[ReStim](https://github.com/diglet48/restim)** by [diglet48](https://github.com/diglet48) — e-stim control software that receives T-Code commands from this bridge. Licensed [MIT](https://opensource.org/licenses/MIT).
 
-OSCgoesZAP does not include or modify any code from either project. It communicates with OscGoesBrrr via the OSC protocol and with ReStim via its WebSocket T-Code interface. Our MIT license applies only to the bridge code in this repository.
+OSCgoesZAP does not include or modify any code from either project. It communicates with OscGoesBrrr via the OSC protocol and with ReStim via its WebSocket T-Code interface.
 
 ---
 
@@ -167,4 +167,4 @@ OSCgoesZAP does not include or modify any code from either project. It communica
 
 MIT — see [LICENSE](LICENSE)
 
-OSCgoesZAP is an independent interoperability tool. It does not contain any code from OscGoesBrrr (CC BY-NC-SA 4.0) or ReStim, and is not a derivative work of either project.
+OSCgoesZAP is an independent interoperability tool and not a derivative work of either dependency.
