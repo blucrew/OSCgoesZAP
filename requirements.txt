@@ -1,0 +1,2 @@
+python-osc>=1.8.0
+aiohttp>=3.9.0
