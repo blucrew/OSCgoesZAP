@@ -2,7 +2,7 @@
 
 **VRChat proximity → ReStim e-stim bridge**
 
-Connects [OscGoesBrrr](https://github.com/200Tigersbloxed/OscGoesBrrr) avatar contact data to [ReStim](https://github.com/fenris91/restim) via T-Code over WebSocket — so physical contact in VRChat drives real e-stim output with no Intiface required.
+Connects [OscGoesBrrr](https://github.com/OscToys/OscGoesBrrr) avatar contact data to [ReStim](https://github.com/diglet48/restim) via T-Code over WebSocket — so physical contact in VRChat drives real e-stim output with no Intiface required.
 
 ---
 
@@ -43,8 +43,8 @@ VRChat avatar contacts
 
 - **Python 3.10+**
 - **VRChat** with an OGB-compatible avatar
-- **[OscGoesBrrr](https://github.com/200Tigersbloxed/OscGoesBrrr)** — OSC contact output enabled, port 9001
-- **[ReStim](https://github.com/fenris91/restim)** — WebSocket T-Code server enabled (default `ws://localhost:12346`)
+- **[OscGoesBrrr](https://github.com/OscToys/OscGoesBrrr)** — OSC contact output enabled, port 9001
+- **[ReStim](https://github.com/diglet48/restim)** — WebSocket T-Code server enabled (default `ws://localhost:12346`)
 - A compatible e-stim device connected to ReStim
 
 ---
@@ -156,11 +156,15 @@ Key parameters (all adjustable in the GUI Settings tab):
 
 ## Acknowledgements
 
-- [OscGoesBrrr](https://github.com/200Tigersbloxed/OscGoesBrrr) by 200Tigersbloxed — avatar OSC contact system
-- [ReStim](https://github.com/fenris91/restim) by fenris91 — e-stim T-Code controller
+- **[OscGoesBrrr](https://github.com/OscToys/OscGoesBrrr)** by [Senky Dragon](https://github.com/OscToys) — VRChat avatar OSC contact system that feeds proximity data into this bridge. Licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+- **[ReStim](https://github.com/diglet48/restim)** by [diglet48](https://github.com/diglet48) — e-stim control software that receives T-Code commands from this bridge.
+
+OSCgoesZAP does not include or modify any code from either project. It communicates with OscGoesBrrr via the OSC protocol and with ReStim via its WebSocket T-Code interface. Our MIT license applies only to the bridge code in this repository.
 
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+OSCgoesZAP is an independent interoperability tool. It does not contain any code from OscGoesBrrr (CC BY-NC-SA 4.0) or ReStim, and is not a derivative work of either project.
