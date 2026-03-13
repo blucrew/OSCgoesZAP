@@ -114,6 +114,7 @@ class AppConfig:
                 pass
         cfg = cls()
         cfg.addresses = [AddressCfg(a) for a in DEFAULT_ADDRESSES]
+        cfg.save()   # write defaults immediately so a crash doesn't lose first-run state
         return cfg
 
 
