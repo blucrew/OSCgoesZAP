@@ -71,6 +71,14 @@ class AppConfig:
     pulse_max_hz: float = 3.0
     pulse_min_depth: float = 0.3
     pulse_max_depth: float = 1.0
+    # T-Code axis names (must match ReStim Preferences → Funscript/T-Code)
+    axis_volume: str = "L0"
+    axis_beta:   str = "L1"
+    axis_alpha:  str = "L2"
+    # Output floor: min T-Code value sent when intensity > 0 (0 = off, e.g. 1000 = 10%)
+    tcode_floor: int = 0
+    # Loop tick for alpha/pulse generators (ms)
+    send_interval_ms: int = 50
     # Addresses managed separately
     addresses: list = field(default_factory=list)
 
@@ -116,6 +124,13 @@ class AppConfig:
 def _tv(v: float) -> str:
     """float 0..1 → 4-digit T-Code string."""
     return str(int(max(0.0, min(1.0, v)) * 9999)).zfill(4)
+
+
+def _tv_floor(v: float, floor_val: int) -> str:
+    """float 0..1 → 4-digit T-Code string with minimum floor when v > 0."""
+    if v <= 0.0:
+        return "0000"
+    return str(max(floor_val, min(9999, int(v * 9999)))).zfill(4)
 
 
 def _curve(raw: float, dz: float, gamma: float) -> float:
@@ -218,19 +233,22 @@ class BridgeEngine:
         cfg, me = self._cfg, self._mode_eff
         parts = []
 
-        # L0 volume — skipped when pulse loop is driving L0
+        # Volume axis — skipped when pulse loop is driving it
         if not cfg.pulse:
-            parts.append(f"L0{_tv(me['l0'])}I100")
+            v0 = _tv_floor(me["l0"], cfg.tcode_floor)
+            parts.append(f"{cfg.axis_volume}{v0}I100")
+            self._shared["__live__l0"] = me["l0"]
 
-        # L1 beta tier
+        # Beta axis tier
         eff_l1 = me["l1"]
         desired = cfg.beta_off
         if eff_l1 > 0.0:
             desired = cfg.beta_active if eff_l1 >= cfg.beta_thresh else cfg.beta_light
         if desired != self._current_beta:
             t = 500 if desired == cfg.beta_off else 200
-            parts.append(f"L1{desired:04d}I{t}")
+            parts.append(f"{cfg.axis_beta}{desired:04d}I{t}")
             self._current_beta = desired
+        self._shared["__live__l1"] = self._current_beta / 9999.0
 
         if parts:
             await self._send(" ".join(parts))
@@ -238,36 +256,40 @@ class BridgeEngine:
     # ── Background loops ─────────────────────────────────────────────────────
 
     async def _alpha_loop(self):
-        dt = 0.05
         while not self._stop_ev.is_set():
             cfg = self._cfg
+            dt = cfg.send_interval_ms / 1000.0
             eff = self._mode_eff["l2"] if cfg.l2 else 0.0
             if eff < 0.01:
                 if not self._alpha_parked:
-                    await self._send(f"L2{_tv(0.5)}I500")
+                    await self._send(f"{cfg.axis_alpha}{_tv(0.5)}I500")
                     self._alpha_parked = True
                 self._alpha_phase = 0.0
+                self._shared["__live__l2"] = 0.0
             else:
                 self._alpha_parked = False
                 hz  = cfg.alpha_min_hz  + (cfg.alpha_max_hz  - cfg.alpha_min_hz)  * eff
                 amp = cfg.alpha_min_amp + (cfg.alpha_max_amp - cfg.alpha_min_amp) * eff
                 pos = 0.5 + amp * math.sin(2 * math.pi * self._alpha_phase)
                 self._alpha_phase = (self._alpha_phase + hz * dt) % 1.0
-                await self._send(f"L2{_tv(pos)}I{int(dt * 1000)}")
+                await self._send(f"{cfg.axis_alpha}{_tv(pos)}I{int(dt * 1000)}")
+                self._shared["__live__l2"] = eff
             await asyncio.sleep(dt)
 
     async def _pulse_loop(self):
-        """Drives L0 with a triangle-wave pulse when pulse mode is active."""
-        dt = 0.05
+        """Drives volume axis with a triangle-wave pulse when pulse mode is active."""
         while not self._stop_ev.is_set():
             cfg = self._cfg
+            dt = cfg.send_interval_ms / 1000.0
             eff = self._mode_eff["pulse"] if cfg.pulse else 0.0
             if eff > 0.01:
                 hz    = cfg.pulse_min_hz    + (cfg.pulse_max_hz    - cfg.pulse_min_hz)    * eff
                 depth = cfg.pulse_min_depth + (cfg.pulse_max_depth - cfg.pulse_min_depth) * eff
                 wave  = 1.0 - abs(2.0 * (self._pulse_phase % 1.0) - 1.0)  # triangle 0→1→0
                 val   = eff * ((1.0 - depth) + depth * wave)
-                await self._send(f"L0{_tv(val)}I{int(dt * 1000)}")
+                tv    = _tv_floor(val, cfg.tcode_floor)
+                await self._send(f"{cfg.axis_volume}{tv}I{int(dt * 1000)}")
+                self._shared["__live__l0"] = val
                 self._pulse_phase = (self._pulse_phase + hz * dt) % 1.0
             else:
                 if self._pulse_phase != 0.0:
@@ -285,8 +307,15 @@ class BridgeEngine:
                     for k in [k for k in self._shared if not k.startswith("__")]:
                         self._shared[k] = 0.0
                     self._mode_eff = {"l0": 0.0, "l1": 0.0, "l2": 0.0, "pulse": 0.0}
-                    await self._send(f"L1{self._cfg.beta_off:04d}I500 L0{_tv(0.0)}I500")
+                    cfg = self._cfg
+                    await self._send(
+                        f"{cfg.axis_beta}{cfg.beta_off:04d}I500 "
+                        f"{cfg.axis_volume}0000I500"
+                    )
                     self._current_beta = self._cfg.beta_off
+                    self._shared["__live__l0"] = 0.0
+                    self._shared["__live__l1"] = cfg.beta_off / 9999.0
+                    self._shared["__live__l2"] = 0.0
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -297,8 +326,11 @@ class BridgeEngine:
         if not await self._connect():
             return
 
+        cfg = self._cfg
         await self._send(
-            f"L1{self._cfg.beta_off:04d}I0 L0{_tv(0.0)}I0 L2{_tv(0.5)}I0"
+            f"{cfg.axis_beta}{cfg.beta_off:04d}I0 "
+            f"{cfg.axis_volume}0000I0 "
+            f"{cfg.axis_alpha}{_tv(0.5)}I0"
         )
 
         dispatcher = Dispatcher()
@@ -396,7 +428,8 @@ class BridgeGUI:
         tab1 = ttk.Frame(nb, padding=8)
         nb.add(tab1, text="  Bridge  ")
         self._build_connection(tab1)
-        ttk.Separator(tab1, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        self._build_live_bar(tab1)
+        ttk.Separator(tab1, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         self._build_addresses(tab1)
 
         tab2 = ttk.Frame(nb, padding=8)
@@ -431,6 +464,45 @@ class BridgeGUI:
 
         self._start_btn = ttk.Button(f, text="Start", command=self._toggle_bridge, width=8)
         self._start_btn.pack(side=tk.RIGHT)
+
+    # ── Live output bar ───────────────────────────────────────────────────────
+
+    def _build_live_bar(self, parent):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(f, text="Live →", font=("TkDefaultFont", 7),
+                  foreground="#888").pack(side=tk.LEFT, padx=(2, 6))
+
+        # Volume
+        ttk.Label(f, text="Vol", font=("TkDefaultFont", 7),
+                  foreground="#aaa").pack(side=tk.LEFT)
+        self._live_vol_bar = IntensityBar(f)
+        self._live_vol_bar.pack(side=tk.LEFT, padx=(2, 2))
+        self._live_vol_lbl = ttk.Label(f, text=" 0%", width=5,
+                                        font=("TkFixedFont", 7))
+        self._live_vol_lbl.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Beta
+        ttk.Label(f, text="β", font=("TkDefaultFont", 7),
+                  foreground="#aaa").pack(side=tk.LEFT)
+        self._live_beta_lbl = ttk.Label(f, text="5000", width=5,
+                                         font=("TkFixedFont", 7))
+        self._live_beta_lbl.pack(side=tk.LEFT, padx=(2, 2))
+        ttk.Label(f, text="(C)", font=("TkDefaultFont", 7),
+                  foreground="#888").pack(side=tk.LEFT, padx=(0, 10))
+        self._live_beta_side = ttk.Label(f, text="Centre", width=7,
+                                          font=("TkDefaultFont", 7))
+        self._live_beta_side.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Alpha
+        ttk.Label(f, text="α", font=("TkDefaultFont", 7),
+                  foreground="#aaa").pack(side=tk.LEFT)
+        self._live_alpha_bar = IntensityBar(f)
+        self._live_alpha_bar.pack(side=tk.LEFT, padx=(2, 2))
+        self._live_alpha_lbl = ttk.Label(f, text=" 0%", width=5,
+                                          font=("TkFixedFont", 7))
+        self._live_alpha_lbl.pack(side=tk.LEFT)
 
     # ── Address list ──────────────────────────────────────────────────────────
 
@@ -694,6 +766,12 @@ class BridgeGUI:
                   font=("TkDefaultFont", 7), foreground="#888").grid(
             row=r, column=3, columnspan=3, sticky="w", padx=4)
         r += 1
+        self._fine_slider(f, r, 0, "Min floor (T-code)", 0, 5000, "tcode_floor",
+                          fmt="d", int_val=True, step=50)
+        ttk.Label(f, text="min output when active  (0 = off, 1000 ≈ 10%)",
+                  font=("TkDefaultFont", 7), foreground="#888").grid(
+            row=r, column=3, columnspan=3, sticky="w", padx=4)
+        r += 1
 
         # ── Global modes ─────────────────────────────────────────────────────
         self._section(f, r, "Global Output Modes"); r += 1
@@ -741,10 +819,66 @@ class BridgeGUI:
         self._fine_slider(f, r, 4, "Max depth", 0.0, 1.0,  "pulse_max_depth", step=0.01)
         r += 1
 
+        # ── T-Code axis names ────────────────────────────────────────────────
+        self._section(f, r, "T-Code Axis Names"); r += 1
+
+        axes_info = ttk.Frame(f)
+        axes_info.grid(row=r, column=0, columnspan=6, sticky="ew", padx=4, pady=(0, 4))
+        ttk.Label(axes_info,
+                  text="Must match ReStim  Tools → Preferences → Funscript/T-Code",
+                  font=("TkDefaultFont", 7), foreground="#888").pack(anchor="w")
+        r += 1
+
+        for lbl, attr, default_hint in [
+            ("Volume axis", "axis_volume", "default: L0  → set ReStim 'Volume' to this"),
+            ("Beta axis",   "axis_beta",   "default: L1  → ReStim 'Beta' (already L1)"),
+            ("Alpha axis",  "axis_alpha",  "default: L2  → change ReStim 'Alpha' from L0 to L2"),
+        ]:
+            ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w", padx=(4, 2), pady=2)
+            var = tk.StringVar(value=getattr(self.cfg, attr))
+            ent = ttk.Entry(f, textvariable=var, width=6)
+            ent.grid(row=r, column=1, sticky="w", padx=2)
+            ttk.Label(f, text=default_hint, font=("TkDefaultFont", 7),
+                      foreground="#777").grid(row=r, column=2, columnspan=4,
+                                              sticky="w", padx=4)
+            def _bind_axis(v=var, a=attr):
+                val = v.get().strip().upper()
+                if val:
+                    setattr(self.cfg, a, val)
+            var.trace_add("write", lambda *_, v=var, a=attr: _bind_axis(v, a))
+            r += 1
+
+        # ── ReStim setup guide ───────────────────────────────────────────────
+        self._section(f, r, "ReStim Setup Guide"); r += 1
+        guide_frame = ttk.Frame(f, padding=(4, 2, 4, 6))
+        guide_frame.grid(row=r, column=0, columnspan=6, sticky="ew")
+        guide_text = (
+            "In ReStim:  Tools → Preferences → Funscript / T-Code\n"
+            "\n"
+            "  Set each axis to match the values above:\n"
+            "    Volume  →  L0   (empty by default — must be set)\n"
+            "    Beta    →  L1   (already L1 by default — no change needed)\n"
+            "    Alpha   →  L2   (default is L0 — change this to L2)\n"
+            "\n"
+            "  Also set Limit Min / Limit Max to match your device's range.\n"
+            "  For FOC-Stim: Volume 0→1,  Beta -1→1,  Alpha -1→1"
+        )
+        ttk.Label(guide_frame, text=guide_text, font=("TkFixedFont", 7),
+                  foreground="#bbbbbb", justify=tk.LEFT,
+                  background="#1a1a1a", relief=tk.FLAT,
+                  padding=(6, 4)).pack(fill=tk.X)
+        r += 1
+
         # ── Timing ───────────────────────────────────────────────────────────
         self._section(f, r, "Timing"); r += 1
         self._fine_slider(f, r, 0, "Idle timeout (s)", 0.1, 10.0,
                           "idle_timeout", step=0.1); r += 1
+        self._fine_slider(f, r, 0, "Send interval (ms)", 10, 200,
+                          "send_interval_ms", fmt="d", int_val=True, step=5)
+        ttk.Label(f, text="alpha/pulse loop tick  (lower = smoother, higher = lighter CPU)",
+                  font=("TkDefaultFont", 7), foreground="#888").grid(
+            row=r, column=3, columnspan=3, sticky="w", padx=4)
+        r += 1
 
     # ── Log panel ─────────────────────────────────────────────────────────────
 
@@ -813,6 +947,24 @@ class BridgeGUI:
         for info in self._addr_row_widgets:
             v = self._shared.get(info["ac"].address, 0.0)
             info["bar"].set(v)
+
+        # Update live output bar
+        l0 = self._shared.get("__live__l0", 0.0)
+        l1 = self._shared.get("__live__l1", self.cfg.beta_off / 9999.0)
+        l2 = self._shared.get("__live__l2", 0.0)
+        self._live_vol_bar.set(l0)
+        self._live_vol_lbl.config(text=f"{int(l0 * 100):2d}%")
+        beta_raw = int(l1 * 9999)
+        if beta_raw < 4800:
+            side = "◄ Left"
+        elif beta_raw > 5200:
+            side = "Right ►"
+        else:
+            side = "Centre"
+        self._live_beta_lbl.config(text=str(beta_raw))
+        self._live_beta_side.config(text=side)
+        self._live_alpha_bar.set(l2)
+        self._live_alpha_lbl.config(text=f"{int(l2 * 100):2d}%")
 
         # Show discovered addresses not yet in the active list
         known = {ac.address for ac in self.cfg.addresses}
