@@ -41,7 +41,7 @@ logging.basicConfig(
 
 OSC_IP     = "127.0.0.1"
 OSC_PORT   = 9001
-RESTIM_URL = "ws://localhost:12346"
+RESTIM_URL = "ws://localhost:12346/tcode"
 
 # All OGB addresses to monitor — bridge takes the max across all of them
 OSC_ADDRESSES = [
@@ -110,6 +110,7 @@ class OGBRestimBridge:
         self._alpha_phase: float = 0.0
         self._alpha_parked: bool = True
         self._loop = None
+        self._send_lock = None  # asyncio.Lock created in run()
 
     # ── ReStim connection ───────────────────────────────────────────────────
 
@@ -124,96 +125,103 @@ class OGBRestimBridge:
             return False
 
     async def send_tcode(self, cmd: str):
-        if self._ws is None or self._ws.closed:
-            logging.warning("ReStim disconnected — reconnecting…")
-            await self.connect_restim()
-            if self._ws is None:
-                return
-        try:
-            await self._ws.send_str(cmd)
-            logging.debug(">> %s", cmd)
-        except Exception as e:
-            logging.error("Send error: %s", e)
+        """Send a T-code string — serialised through a lock so concurrent
+        callers never interleave frames on the WebSocket."""
+        if self._send_lock is None:
+            return
+        async with self._send_lock:
+            if self._ws is None or self._ws.closed:
+                logging.warning("ReStim disconnected — reconnecting…")
+                await self.connect_restim()
+                if self._ws is None:
+                    return
+            try:
+                await self._ws.send_str(cmd)
+                logging.debug(">> %s", cmd)
+            except Exception as e:
+                logging.error("Send error: %s", e)
+                self._ws = None
 
     # ── OSC callbacks ───────────────────────────────────────────────────────
 
     def on_ogb_intensity(self, address: str, *args):
-        """Called by python-osc for each monitored OSC address."""
+        """Called by python-osc — just update state, send loop does the rest."""
         if not args:
             return
         self._addr_intensity[address] = float(args[0])
         self._last_osc_time = self._loop.time()
-
-        effective = _apply_curve(max(self._addr_intensity.values()))
-        self._effective = effective
-
-        asyncio.run_coroutine_threadsafe(
-            self._update_volume_and_beta(effective), self._loop
-        )
-
-    async def _update_volume_and_beta(self, effective: float):
-        """Send L0 volume. Send L1 beta only when the tier changes."""
-        desired_beta = _beta_tier(effective)
-        if desired_beta != self._current_beta:
-            transition = 500 if desired_beta == BETA_OFF else 200
-            await self.send_tcode(f"L1{desired_beta:04d}I{transition}")
-            self._current_beta = desired_beta
-
-        await self.send_tcode(f"L0{_tcode_val(effective)}I{INTERVAL_MS}")
+        self._effective = _apply_curve(max(self._addr_intensity.values()))
 
     def _default_osc_handler(self, address: str, *args):
         if args and isinstance(args[0], float):
             logging.debug("OSC (unmatched): %s = %s", address, args)
 
-    # ── Alpha oscillator ────────────────────────────────────────────────────
+    # ── Unified send loop ───────────────────────────────────────────────────
 
-    async def _alpha_oscillator(self):
-        """Background task — sinusoidally oscillates L2 (alpha).
-        Rate and amplitude both scale with effective intensity.
+    async def _send_loop(self):
+        """Single owner of all outbound T-code — runs at SEND_HZ.
+        Combines L0 + L1 + L2 into one message per tick so ReStim
+        never sees more than SEND_HZ messages/second regardless of
+        how fast OSC fires or how often alpha needs updating.
         """
-        if self._no_alpha:
-            return
+        SEND_HZ = 20          # max messages/sec to ReStim
+        dt = 1.0 / SEND_HZ
 
-        dt = 0.05  # 50 ms tick → ~20 Hz update rate
         while True:
+            await asyncio.sleep(dt)
             eff = self._effective
-            if eff < 0.01:
+            now = self._loop.time()
+
+            # ── Idle watchdog ──
+            if self._current_beta != BETA_OFF:
+                if now - self._last_osc_time > IDLE_TIMEOUT:
+                    logging.info("No OSC signal — parking to off")
+                    for k in self._addr_intensity:
+                        self._addr_intensity[k] = 0.0
+                    self._effective = 0.0
+                    eff = 0.0
+
+            # ── Alpha (L2) ──
+            if self._no_alpha or eff < 0.01:
                 if not self._alpha_parked:
-                    await self.send_tcode(f"L2{_tcode_val(ALPHA_CENTER)}I500")
+                    l2_val = _tcode_val(ALPHA_CENTER)
+                    l2_time = 500
                     self._alpha_parked = True
-                self._alpha_phase = 0.0
+                    self._alpha_phase = 0.0
+                else:
+                    l2_val = None
+                    l2_time = 0
             else:
                 self._alpha_parked = False
                 hz  = ALPHA_MIN_HZ  + (ALPHA_MAX_HZ  - ALPHA_MIN_HZ)  * eff
                 amp = ALPHA_MIN_AMP + (ALPHA_MAX_AMP - ALPHA_MIN_AMP) * eff
                 pos = ALPHA_CENTER + amp * math.sin(2 * math.pi * self._alpha_phase)
                 self._alpha_phase = (self._alpha_phase + hz * dt) % 1.0
-                await self.send_tcode(f"L2{_tcode_val(pos)}I{int(dt * 1000)}")
+                l2_val = _tcode_val(pos)
+                l2_time = int(dt * 1000)
 
-            await asyncio.sleep(dt)
+            # ── Beta (L1) ──
+            desired_beta = _beta_tier(eff)
+            parts = []
+            if desired_beta != self._current_beta:
+                transition = 500 if desired_beta == BETA_OFF else 200
+                parts.append(f"L1{desired_beta:04d}I{transition}")
+                self._current_beta = desired_beta
 
-    # ── Idle watchdog ───────────────────────────────────────────────────────
+            # ── Volume (L0) ──
+            parts.append(f"L0{_tcode_val(eff)}I{INTERVAL_MS}")
 
-    async def _idle_watchdog(self):
-        """Park everything if no OSC received for IDLE_TIMEOUT seconds."""
-        while True:
-            await asyncio.sleep(0.1)
-            if self._current_beta != BETA_OFF and self._loop is not None:
-                elapsed = self._loop.time() - self._last_osc_time
-                if elapsed > IDLE_TIMEOUT:
-                    logging.info("No OSC signal — parking to off")
-                    for k in self._addr_intensity:
-                        self._addr_intensity[k] = 0.0
-                    self._effective = 0.0
-                    await self.send_tcode(
-                        f"L1{BETA_OFF:04d}I500 L0{_tcode_val(0.0)}I500"
-                    )
-                    self._current_beta = BETA_OFF
+            # ── Alpha (L2) — append if needed ──
+            if l2_val is not None:
+                parts.append(f"L2{l2_val}I{l2_time}")
+
+            await self.send_tcode(" ".join(parts))
 
     # ── Main ────────────────────────────────────────────────────────────────
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        self._send_lock = asyncio.Lock()
 
         if not await self.connect_restim():
             logging.error(
@@ -248,8 +256,7 @@ class OGBRestimBridge:
 
         try:
             await asyncio.gather(
-                self._idle_watchdog(),
-                self._alpha_oscillator(),
+                self._send_loop(),
             )
         finally:
             transport.close()

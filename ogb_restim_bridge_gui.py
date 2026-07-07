@@ -21,6 +21,22 @@ import aiohttp
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# OGB-inspired dark theme palette
+# ──────────────────────────────────────────────────────────────────────────────
+
+BG     = "#111111"   # window / frame background
+BG2    = "#1a1a1a"   # slightly lighter panels (log, info boxes)
+BG3    = "#222222"   # raised surfaces (entries, canvas, tab inactive)
+BORDER = "#2a2a2a"   # border / divider
+FG     = "#ffffff"   # primary text
+FG2    = "#999999"   # secondary / muted text
+ACCENT = "#5fa3ff"   # blue accent (Start button, active slider)
+SUCCESS= "#4caf50"   # connected indicator
+ERROR  = "#f44336"   # error / disconnected indicator
+WARN   = "#ff9800"   # warning (connecting…)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Config dataclasses
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -46,7 +62,7 @@ class AddressCfg:
 
 @dataclass
 class AppConfig:
-    restim_url: str = "ws://localhost:12346"
+    restim_url: str = "ws://localhost:12346/tcode"
     osc_port: int = 9001
     idle_timeout: float = 0.5
     dead_zone: float = 0.02
@@ -161,6 +177,8 @@ class BridgeEngine:
         self._last_osc = 0.0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_ev: Optional[asyncio.Event] = None
+        self._next_connect_at: float = 0.0      # reconnect cooldown
+        self._prev_vol_active: bool = False      # for zero↔nonzero log transitions
 
     # ── Logging / connection ─────────────────────────────────────────────────
 
@@ -179,8 +197,12 @@ class BridgeEngine:
 
     async def _send(self, cmd: str):
         if self._ws is None or self._ws.closed:
+            now = self._loop.time()
+            if now < self._next_connect_at:
+                return                          # still in cooldown — drop silently
             await self._connect()
             if self._ws is None:
+                self._next_connect_at = self._loop.time() + 5.0  # failed — retry in 5s
                 return
         try:
             await self._ws.send_str(cmd)
@@ -234,19 +256,51 @@ class BridgeEngine:
         cfg, me = self._cfg, self._mode_eff
         parts = []
 
-        # Volume axis — skipped when pulse loop is driving it
-        if not cfg.pulse:
+        # Volume axis — skipped when pulse loop is driving it, or when L0 globally disabled
+        if not cfg.pulse and cfg.l0:
             v0 = _tv_floor(me["l0"], cfg.tcode_floor)
             parts.append(f"{cfg.axis_volume}{v0}I100")
             self._shared["__live__l0"] = me["l0"]
+            now_active = me["l0"] > 0.0
+            if now_active and not self._prev_vol_active:
+                self._log(f"Signal active → TX: {cfg.axis_volume}{v0}I100")
+            elif not now_active and self._prev_vol_active:
+                self._log("Signal stopped (idle)")
+            self._prev_vol_active = now_active
 
-        # Beta axis tier
-        eff_l1 = me["l1"]
-        desired = cfg.beta_off
-        if eff_l1 > 0.0:
-            desired = cfg.beta_active if eff_l1 >= cfg.beta_thresh else cfg.beta_light
-        if desired != self._current_beta:
-            t = 500 if desired == cfg.beta_off else 200
+        # Beta axis — continuous piecewise-linear mapping:
+        #   intensity 0.0          → beta_off    (idle position)
+        #   intensity beta_thresh  → beta_light  (midpoint anchor)
+        #   intensity 1.0          → beta_active (full position)
+        # Replaces the old 3-tier discrete snap so small contact movements
+        # actually modulate the beta position smoothly.
+        eff_l1 = me["l1"] if cfg.l1 else 0.0
+        if eff_l1 <= 0.0:
+            desired = cfg.beta_off
+        elif eff_l1 >= 1.0:
+            desired = cfg.beta_active
+        elif eff_l1 < cfg.beta_thresh:
+            # Interpolate from off → light over [0, beta_thresh]
+            if cfg.beta_thresh > 0.0:
+                f = eff_l1 / cfg.beta_thresh
+                desired = int(round(cfg.beta_off + (cfg.beta_light - cfg.beta_off) * f))
+            else:
+                desired = cfg.beta_light
+        else:
+            # Interpolate from light → active over [beta_thresh, 1.0]
+            span = 1.0 - cfg.beta_thresh
+            if span > 0.0:
+                f = (eff_l1 - cfg.beta_thresh) / span
+                desired = int(round(cfg.beta_light + (cfg.beta_active - cfg.beta_light) * f))
+            else:
+                desired = cfg.beta_active
+
+        # Dead-band: only send if changed by ≥30 T-code units OR if returning
+        # to the idle position (always force the off snap so device parks).
+        delta = abs(desired - self._current_beta)
+        returning_to_off = (desired == cfg.beta_off and self._current_beta != cfg.beta_off)
+        if delta >= 30 or returning_to_off:
+            t = 500 if returning_to_off else 80
             parts.append(f"{cfg.axis_beta}{desired:04d}I{t}")
             self._current_beta = desired
         self._shared["__live__l1"] = self._current_beta / 9999.0
@@ -380,13 +434,14 @@ class IntensityBar(tk.Canvas):
 
     def __init__(self, parent, **kw):
         super().__init__(parent, width=self.W, height=self.H,
-                         bg="#222", highlightthickness=1,
-                         highlightbackground="#444", **kw)
-        self._rect = self.create_rectangle(0, 0, 0, self.H, fill="#00bb44", outline="")
+                         bg=BG3, highlightthickness=1,
+                         highlightbackground=BORDER, **kw)
+        self._rect = self.create_rectangle(0, 0, 0, self.H, fill=SUCCESS, outline="")
 
     def set(self, v: float):
         w = int(max(0.0, min(1.0, v)) * self.W)
         self.coords(self._rect, 0, 0, w, self.H)
+        # Green → yellow → red gradient as intensity rises
         if v < 0.5:
             r, g = int(v * 2 * 220), 187
         else:
@@ -411,14 +466,88 @@ class BridgeGUI:
         self.root.title("OGB → ReStim Bridge")
         self.root.minsize(560, 540)
 
-        try:
-            ttk.Style().theme_use("clam")
-        except Exception:
-            pass
-
+        self._apply_theme()
         self._build_ui()
         self.root.after(150, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Dark theme ────────────────────────────────────────────────────────────
+
+    def _apply_theme(self):
+        """Apply OGB-inspired dark theme via ttk.Style + root configure."""
+        self.root.configure(bg=BG)
+        st = ttk.Style(self.root)
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+
+        # ── Frames / containers ───────────────────────────────────────────────
+        st.configure("TFrame",      background=BG)
+        st.configure("TLabelframe", background=BG, foreground=FG2,
+                     bordercolor=BORDER, relief="flat")
+        st.configure("TLabelframe.Label", background=BG, foreground=FG2,
+                     font=("Arial", 9))
+
+        # ── Labels ────────────────────────────────────────────────────────────
+        st.configure("TLabel", background=BG, foreground=FG, font=("Arial", 9))
+
+        # ── Notebook (tabs) ───────────────────────────────────────────────────
+        st.configure("TNotebook",     background=BG, bordercolor=BORDER,
+                     tabmargins=[0, 0, 0, 0])
+        st.configure("TNotebook.Tab", background=BG3, foreground=FG2,
+                     padding=[10, 4], font=("Arial", 9))
+        st.map("TNotebook.Tab",
+               background=[("selected", BG2), ("active", BG3)],
+               foreground=[("selected", FG),  ("active", FG)])
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        st.configure("TButton", background=BG3, foreground=FG,
+                     bordercolor=BORDER, focuscolor="none",
+                     relief="flat", font=("Arial", 9), padding=[4, 2])
+        st.map("TButton",
+               background=[("active", "#333333"), ("pressed", "#2a2a2a")],
+               foreground=[("disabled", FG2)])
+
+        # Accent = blue Start / Stop button
+        st.configure("Accent.TButton", background=ACCENT, foreground="#000000",
+                     bordercolor=ACCENT, focuscolor="none",
+                     relief="flat", font=("Arial", 9, "bold"), padding=[6, 3])
+        st.map("Accent.TButton",
+               background=[("active", "#4d91ee"), ("pressed", "#3d81de")])
+
+        # ── Entries / Spinbox ─────────────────────────────────────────────────
+        st.configure("TEntry",
+                     fieldbackground=BG3, foreground=FG,
+                     bordercolor=BORDER, insertcolor=FG,
+                     selectbackground=ACCENT, selectforeground="#000000")
+        st.configure("TSpinbox",
+                     fieldbackground=BG3, foreground=FG,
+                     bordercolor=BORDER, insertcolor=FG,
+                     arrowcolor=FG2, background=BG3)
+
+        # ── Checkbuttons ──────────────────────────────────────────────────────
+        st.configure("TCheckbutton", background=BG, foreground=FG,
+                     focuscolor="none", font=("Arial", 9))
+        st.map("TCheckbutton",
+               background=[("active", BG)],
+               foreground=[("disabled", FG2)],
+               indicatorcolor=[("selected", ACCENT), ("!selected", BG3)])
+
+        # ── Scale (slider) ────────────────────────────────────────────────────
+        st.configure("TScale", background=BG, troughcolor=BG3,
+                     sliderlength=12, sliderrelief="flat", bordercolor=BORDER)
+        st.map("TScale",
+               background=[("active", ACCENT)],
+               troughcolor=[("active", BG3)])
+
+        # ── Scrollbar ─────────────────────────────────────────────────────────
+        st.configure("TScrollbar", background=BG3, troughcolor=BG,
+                     bordercolor=BORDER, arrowcolor=FG2, relief="flat")
+        st.map("TScrollbar", background=[("active", "#444444")])
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        st.configure("TSeparator", background=BORDER)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -446,11 +575,10 @@ class BridgeGUI:
         f.pack(fill=tk.X)
 
         self._dot_canvas = tk.Canvas(f, width=14, height=14,
-                                     bg=self.root.cget("bg"),
-                                     highlightthickness=0)
+                                     bg=BG, highlightthickness=0)
         self._dot_canvas.pack(side=tk.LEFT, padx=(0, 4))
         self._dot = self._dot_canvas.create_oval(2, 2, 12, 12,
-                                                  fill="#bb3333", outline="")
+                                                  fill=ERROR, outline="")
         self._status_lbl = ttk.Label(f, text="Stopped", width=12)
         self._status_lbl.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -463,7 +591,8 @@ class BridgeGUI:
         ttk.Spinbox(f, textvariable=self._port_var,
                     from_=1024, to=65535, width=6).pack(side=tk.LEFT, padx=4)
 
-        self._start_btn = ttk.Button(f, text="Start", command=self._toggle_bridge, width=8)
+        self._start_btn = ttk.Button(f, text="Start", style="Accent.TButton",
+                                     command=self._toggle_bridge, width=8)
         self._start_btn.pack(side=tk.RIGHT)
 
     # ── Live output bar ───────────────────────────────────────────────────────
@@ -472,37 +601,35 @@ class BridgeGUI:
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=(4, 0))
 
-        ttk.Label(f, text="Live →", font=("TkDefaultFont", 7),
-                  foreground="#888").pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(f, text="Live →", font=("Arial", 7),
+                  foreground=FG2).pack(side=tk.LEFT, padx=(2, 6))
 
         # Volume
-        ttk.Label(f, text="Vol", font=("TkDefaultFont", 7),
-                  foreground="#aaa").pack(side=tk.LEFT)
+        ttk.Label(f, text="Vol", font=("Arial", 7),
+                  foreground=FG2).pack(side=tk.LEFT)
         self._live_vol_bar = IntensityBar(f)
         self._live_vol_bar.pack(side=tk.LEFT, padx=(2, 2))
         self._live_vol_lbl = ttk.Label(f, text=" 0%", width=5,
-                                        font=("TkFixedFont", 7))
+                                        font=("Consolas", 7))
         self._live_vol_lbl.pack(side=tk.LEFT, padx=(0, 10))
 
         # Beta
-        ttk.Label(f, text="β", font=("TkDefaultFont", 7),
-                  foreground="#aaa").pack(side=tk.LEFT)
+        ttk.Label(f, text="β", font=("Arial", 7),
+                  foreground=FG2).pack(side=tk.LEFT)
         self._live_beta_lbl = ttk.Label(f, text="5000", width=5,
-                                         font=("TkFixedFont", 7))
+                                         font=("Consolas", 7))
         self._live_beta_lbl.pack(side=tk.LEFT, padx=(2, 2))
-        ttk.Label(f, text="(C)", font=("TkDefaultFont", 7),
-                  foreground="#888").pack(side=tk.LEFT, padx=(0, 10))
         self._live_beta_side = ttk.Label(f, text="Centre", width=7,
-                                          font=("TkDefaultFont", 7))
+                                          font=("Arial", 7), foreground=FG2)
         self._live_beta_side.pack(side=tk.LEFT, padx=(0, 10))
 
         # Alpha
-        ttk.Label(f, text="α", font=("TkDefaultFont", 7),
-                  foreground="#aaa").pack(side=tk.LEFT)
+        ttk.Label(f, text="α", font=("Arial", 7),
+                  foreground=FG2).pack(side=tk.LEFT)
         self._live_alpha_bar = IntensityBar(f)
         self._live_alpha_bar.pack(side=tk.LEFT, padx=(2, 2))
         self._live_alpha_lbl = ttk.Label(f, text=" 0%", width=5,
-                                          font=("TkFixedFont", 7))
+                                          font=("Consolas", 7))
         self._live_alpha_lbl.pack(side=tk.LEFT)
 
     # ── Address list ──────────────────────────────────────────────────────────
@@ -511,7 +638,7 @@ class BridgeGUI:
         hdr = ttk.Frame(parent)
         hdr.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(hdr, text="OSC Addresses",
-                  font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT)
+                  font=("Arial", 9, "bold"), foreground=FG2).pack(side=tk.LEFT)
         ttk.Button(hdr, text="+ Add", command=self._add_address,
                    width=7).pack(side=tk.RIGHT)
 
@@ -519,7 +646,8 @@ class BridgeGUI:
         wrap = ttk.Frame(parent)
         wrap.pack(fill=tk.BOTH, expand=True)
 
-        self._addr_canvas = tk.Canvas(wrap, highlightthickness=0, height=200)
+        self._addr_canvas = tk.Canvas(wrap, highlightthickness=0, height=200,
+                                      bg=BG)
         _asb = ttk.Scrollbar(wrap, orient=tk.VERTICAL,
                              command=self._addr_canvas.yview)
         self._addr_canvas.configure(yscrollcommand=_asb.set)
@@ -576,7 +704,7 @@ class BridgeGUI:
 
         short = ac.address.replace("/avatar/parameters/", "…/")
         ttk.Label(hdr, text=short, width=34, anchor="w",
-                  font=("TkFixedFont", 8)).pack(side=tk.LEFT, padx=(2, 4))
+                  font=("Consolas", 8)).pack(side=tk.LEFT, padx=(2, 4))
 
         bar = IntensityBar(hdr)
         bar.pack(side=tk.LEFT, padx=(0, 4))
@@ -664,7 +792,7 @@ class BridgeGUI:
     # ── Settings tab ──────────────────────────────────────────────────────────
 
     def _build_settings(self, parent):
-        self._settings_canvas = tk.Canvas(parent, highlightthickness=0)
+        self._settings_canvas = tk.Canvas(parent, highlightthickness=0, bg=BG)
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL,
                            command=self._settings_canvas.yview)
         self._settings_canvas.configure(yscrollcommand=sb.set)
@@ -692,8 +820,8 @@ class BridgeGUI:
     def _section(self, parent, row: int, text: str):
         sf = ttk.Frame(parent)
         sf.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(14, 3), padx=4)
-        ttk.Label(sf, text=text,
-                  font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(sf, text=text, font=("Arial", 9, "bold"),
+                  foreground=FG2).pack(side=tk.LEFT)
         ttk.Separator(sf, orient=tk.HORIZONTAL).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
@@ -764,13 +892,13 @@ class BridgeGUI:
         self._fine_slider(f, r, 0, "Gamma (curve)", 0.2,  2.0,  "gamma",
                           step=0.05)
         ttk.Label(f, text="← sqrt · linear · squared →",
-                  font=("TkDefaultFont", 7), foreground="#888").grid(
+                  font=("Arial", 7), foreground=FG2).grid(
             row=r, column=3, columnspan=3, sticky="w", padx=4)
         r += 1
         self._fine_slider(f, r, 0, "Min floor (T-code)", 0, 5000, "tcode_floor",
                           fmt="d", int_val=True, step=50)
         ttk.Label(f, text="min output when active  (0 = off, 1000 ≈ 10%)",
-                  font=("TkDefaultFont", 7), foreground="#888").grid(
+                  font=("Arial", 7), foreground=FG2).grid(
             row=r, column=3, columnspan=3, sticky="w", padx=4)
         r += 1
 
@@ -792,13 +920,13 @@ class BridgeGUI:
         self._fine_slider(f, r, 0, "Light pos",  0, 9999, "beta_light",
                           fmt="d", int_val=True, step=50)
         ttk.Label(f, text="gentle touch",
-                  font=("TkDefaultFont", 7), foreground="#888").grid(
+                  font=("Arial", 7), foreground=FG2).grid(
             row=r, column=3, sticky="w", padx=(2, 4))
 
         self._fine_slider(f, r, 4, "Active pos", 0, 9999, "beta_active",
                           fmt="d", int_val=True, step=50)
         ttk.Label(f, text="full intensity",
-                  font=("TkDefaultFont", 7), foreground="#888").grid(
+                  font=("Arial", 7), foreground=FG2).grid(
             row=r, column=7, sticky="w", padx=(2, 4))
         r += 1
 
@@ -827,7 +955,7 @@ class BridgeGUI:
         axes_info.grid(row=r, column=0, columnspan=6, sticky="ew", padx=4, pady=(0, 4))
         ttk.Label(axes_info,
                   text="Must match ReStim  Tools → Preferences → Funscript/T-Code",
-                  font=("TkDefaultFont", 7), foreground="#888").pack(anchor="w")
+                  font=("Arial", 7), foreground=FG2).pack(anchor="w")
         r += 1
 
         for lbl, attr, default_hint in [
@@ -839,9 +967,9 @@ class BridgeGUI:
             var = tk.StringVar(value=getattr(self.cfg, attr))
             ent = ttk.Entry(f, textvariable=var, width=6)
             ent.grid(row=r, column=1, sticky="w", padx=2)
-            ttk.Label(f, text=default_hint, font=("TkDefaultFont", 7),
-                      foreground="#777").grid(row=r, column=2, columnspan=4,
-                                              sticky="w", padx=4)
+            ttk.Label(f, text=default_hint, font=("Arial", 7),
+                      foreground=FG2).grid(row=r, column=2, columnspan=4,
+                                           sticky="w", padx=4)
             def _bind_axis(v=var, a=attr):
                 val = v.get().strip().upper()
                 if val:
@@ -864,9 +992,9 @@ class BridgeGUI:
             "  Also set Limit Min / Limit Max to match your device's range.\n"
             "  For FOC-Stim: Volume 0→1,  Beta -1→1,  Alpha -1→1"
         )
-        ttk.Label(guide_frame, text=guide_text, font=("TkFixedFont", 7),
-                  foreground="#bbbbbb", justify=tk.LEFT,
-                  background="#1a1a1a", relief=tk.FLAT,
+        ttk.Label(guide_frame, text=guide_text, font=("Consolas", 7),
+                  foreground=FG2, justify=tk.LEFT,
+                  background=BG2, relief=tk.FLAT,
                   padding=(6, 4)).pack(fill=tk.X)
         r += 1
 
@@ -877,7 +1005,7 @@ class BridgeGUI:
         self._fine_slider(f, r, 0, "Send interval (ms)", 10, 200,
                           "send_interval_ms", fmt="d", int_val=True, step=5)
         ttk.Label(f, text="alpha/pulse loop tick  (lower = smoother, higher = lighter CPU)",
-                  font=("TkDefaultFont", 7), foreground="#888").grid(
+                  font=("Arial", 7), foreground=FG2).grid(
             row=r, column=3, columnspan=3, sticky="w", padx=4)
         r += 1
 
@@ -887,9 +1015,11 @@ class BridgeGUI:
         lf = ttk.LabelFrame(parent, text="Log", padding=(4, 2))
         lf.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._log_text = tk.Text(lf, height=4, state=tk.DISABLED,
-                                  font=("TkFixedFont", 8),
-                                  bg="#181818", fg="#cccccc",
-                                  relief=tk.FLAT, wrap=tk.WORD)
+                                  font=("Consolas", 8),
+                                  bg=BG2, fg=FG2,
+                                  insertbackground=FG, selectbackground=ACCENT,
+                                  relief=tk.FLAT, wrap=tk.WORD,
+                                  highlightthickness=0)
         self._log_text.pack(fill=tk.X)
 
     def _append_log(self, msg: str):
@@ -910,7 +1040,7 @@ class BridgeGUI:
                 self._engine.stop()
             self._running = False
             self._start_btn.config(text="Start")
-            self._dot_canvas.itemconfig(self._dot, fill="#bb3333")
+            self._dot_canvas.itemconfig(self._dot, fill=ERROR)
             self._status_lbl.config(text="Stopped")
         else:
             self.cfg.restim_url = self._url_var.get().strip()
@@ -920,7 +1050,7 @@ class BridgeGUI:
             self._engine.start()
             self._running = True
             self._start_btn.config(text="Stop")
-            self._dot_canvas.itemconfig(self._dot, fill="#aaaa00")
+            self._dot_canvas.itemconfig(self._dot, fill=WARN)
             self._status_lbl.config(text="Connecting…")
 
     # ── Poll loop (runs on tkinter main thread) ───────────────────────────────
@@ -933,13 +1063,13 @@ class BridgeGUI:
                 self._append_log(msg)
                 low = msg.lower()
                 if "connected →" in low:
-                    self._dot_canvas.itemconfig(self._dot, fill="#33cc55")
+                    self._dot_canvas.itemconfig(self._dot, fill=SUCCESS)
                     self._status_lbl.config(text="Connected")
                 elif "failed" in low or "error" in low:
-                    self._dot_canvas.itemconfig(self._dot, fill="#cc4444")
+                    self._dot_canvas.itemconfig(self._dot, fill=ERROR)
                     self._status_lbl.config(text="Error")
                 elif "stopped" in low and self._running:
-                    self._dot_canvas.itemconfig(self._dot, fill="#bb3333")
+                    self._dot_canvas.itemconfig(self._dot, fill=ERROR)
                     self._status_lbl.config(text="Stopped")
         except queue.Empty:
             pass
@@ -982,7 +1112,7 @@ class BridgeGUI:
                 row = ttk.Frame(self._disc_frame)
                 row.pack(fill=tk.X, pady=1)
                 short = addr.replace("/avatar/parameters/", "…/")
-                ttk.Label(row, text=short, font=("TkFixedFont", 8),
+                ttk.Label(row, text=short, font=("Consolas", 8),
                           width=42, anchor="w").pack(side=tk.LEFT)
                 def _add(a=addr):
                     self.cfg.addresses.append(AddressCfg(a))
